@@ -1,5 +1,3 @@
-using namespace System.Net
-
 Function Invoke-ListDefenderState {
     <#
     .FUNCTIONALITY
@@ -9,13 +7,9 @@ Function Invoke-ListDefenderState {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
     $StatusCode = [HttpStatusCode]::OK
 
-    # Write to the Azure Functions log stream.
-    Write-Host 'PowerShell HTTP trigger function processed a request.'
+
 
     # Interact with query parameters or the body of the request.
     $TenantFilter = $Request.Query.TenantFilter
@@ -27,8 +21,7 @@ Function Invoke-ListDefenderState {
         $StatusCode = [HttpStatusCode]::Forbidden
         $GraphRequest = "$($ErrorMessage)"
     }
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = $StatusCode
             Body       = @($GraphRequest)
         })

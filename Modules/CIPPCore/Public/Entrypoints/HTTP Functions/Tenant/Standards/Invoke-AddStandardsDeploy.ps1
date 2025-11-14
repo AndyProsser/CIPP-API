@@ -1,5 +1,3 @@
-using namespace System.Net
-
 Function Invoke-AddStandardsDeploy {
     <#
     .FUNCTIONALITY
@@ -9,10 +7,6 @@ Function Invoke-AddStandardsDeploy {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
-
     $user = $request.headers.'x-ms-client-principal'
     $username = ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($user)) | ConvertFrom-Json).userDetails
 
@@ -57,8 +51,7 @@ Function Invoke-AddStandardsDeploy {
     }
 
 
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = $body
         })

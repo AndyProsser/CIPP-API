@@ -1,4 +1,3 @@
-using namespace System.Net
 Function Invoke-ExecGDAPRemoveGArole {
     <#
     .FUNCTIONALITY
@@ -9,7 +8,7 @@ Function Invoke-ExecGDAPRemoveGArole {
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
-    $GDAPID = $request.query.GDAPId ?? $request.Body.GDAPId
+    $GDAPID = $Request.Query.GDAPId ?? $Request.Body.GDAPId
 
     try {
         $CheckActive = New-GraphGetRequest -NoAuthCheck $True -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships/$($GDAPID)" -tenantid $env:TenantID
@@ -45,7 +44,7 @@ Function Invoke-ExecGDAPRemoveGArole {
     $body = @{
         Message = $Message
     }
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = $body
         })

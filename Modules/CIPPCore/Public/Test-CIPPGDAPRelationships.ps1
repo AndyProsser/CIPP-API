@@ -10,7 +10,7 @@ function Test-CIPPGDAPRelationships {
     $MissingGroups = [System.Collections.Generic.List[object]]@()
     try {
         #Get graph request to list all relationships.
-        $Relationships = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships?`$filter=status eq 'active'" -tenantid $ENV:TenantID -NoAuthCheck $true
+        $Relationships = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships?`$filter=status eq 'active'" -tenantid $env:TenantID -NoAuthCheck $true
         #Group relationships by tenant. The tenant information is in $relationships.customer.TenantId.
         $RelationshipsByTenant = $Relationships | Group-Object -Property { $_.customer.TenantId }
         foreach ($Tenant in $RelationshipsByTenant) {
@@ -30,7 +30,7 @@ function Test-CIPPGDAPRelationships {
                             Issue        = 'The relationship has global administrator access. Auto-Extend is not available.'
                             Tenant       = [string]$Group.customer.displayName
                             Relationship = [string]$Group.displayName
-                            Link         = 'https://docs.cipp.app/setup/gdap/troubleshooting#autoextend'
+                            Link         = 'https://docs.cipp.app/setup/installation/recommended-roles'
 
                         }) | Out-Null
                 }

@@ -13,11 +13,35 @@ function Get-CIPPTextReplacement {
     #>
     param (
         [string]$TenantFilter,
-        $Text
+        $Text,
+        [switch]$EscapeForJson
     )
     if ($Text -isnot [string]) {
         return $Text
     }
+
+    $ReservedVariables = @(
+        '%serial%',
+        '%systemroot%',
+        '%systemdrive%',
+        '%temp%',
+        '%tenantid%',
+        '%tenantfilter%',
+        '%initialdomain%',
+        '%tenantname%',
+        '%partnertenantid%',
+        '%samappid%',
+        '%userprofile%',
+        '%username%',
+        '%userdomain%',
+        '%windir%',
+        '%programfiles%',
+        '%programfiles(x86)%',
+        '%programdata%',
+        '%cippuserschema%',
+        '%cippurl%',
+        '%defaultdomain%'
+    )
 
     $Tenant = Get-Tenants -TenantFilter $TenantFilter
     $CustomerId = $Tenant.customerId
@@ -31,28 +55,60 @@ function Get-CIPPTextReplacement {
     $Vars = @{}
     if ($GlobalMap) {
         foreach ($Var in $GlobalMap) {
+            if ($EscapeForJson.IsPresent) {
+                # Escape quotes for JSON if not already escaped
+                $Var.Value = $Var.Value -replace '(?<!\\)"', '\"'
+            }
             $Vars[$Var.RowKey] = $Var.Value
         }
     }
-    # Tenant Specific Variables
-    $ReplaceMap = Get-CIPPAzDataTableEntity @ReplaceTable -Filter "PartitionKey eq '$CustomerId'"
-    if ($ReplaceMap) {
-        foreach ($Var in $ReplaceMap) {
-            $Vars[$Var.RowKey] = $Var.Value
+
+    if ($Tenant) {
+        # Tenant Specific Variables
+        $ReplaceMap = Get-CIPPAzDataTableEntity @ReplaceTable -Filter "PartitionKey eq '$CustomerId'"
+        # If no results found by customerId, try by defaultDomainName
+        if (!$ReplaceMap) {
+            $ReplaceMap = Get-CIPPAzDataTableEntity @ReplaceTable -Filter "PartitionKey eq '$($Tenant.defaultDomainName)'"
+        }
+        if ($ReplaceMap) {
+            foreach ($Var in $ReplaceMap) {
+                if ($EscapeForJson.IsPresent) {
+                    # Escape quotes for JSON if not already escaped
+                    $Var.Value = $Var.Value -replace '(?<!\\)"', '\"'
+                }
+                $Vars[$Var.RowKey] = $Var.Value
+            }
         }
     }
     # Replace custom variables
     foreach ($Replace in $Vars.GetEnumerator()) {
         $String = '%{0}%' -f $Replace.Key
-        $Text = $Text -replace $String, $Replace.Value
+        if ($string -notin $ReservedVariables) {
+            $Text = $Text -replace $String, $Replace.Value
+        }
     }
     #default replacements for all tenants: %tenantid% becomes $tenant.customerId, %tenantfilter% becomes $tenant.defaultDomainName, %tenantname% becomes $tenant.displayName
     $Text = $Text -replace '%tenantid%', $Tenant.customerId
     $Text = $Text -replace '%tenantfilter%', $Tenant.defaultDomainName
+    $Text = $Text -replace '%defaultdomain%', $Tenant.defaultDomainName
+    $Text = $Text -replace '%initialdomain%', $Tenant.initialDomainName
     $Text = $Text -replace '%tenantname%', $Tenant.displayName
 
     # Partner specific replacements
-    $Text = $Text -replace '%partnertenantid%', $ENV:TenantID
-    $Text = $Text -replace '%samappid%', $ENV:ApplicationID
+    $Text = $Text -replace '%partnertenantid%', $env:TenantID
+    $Text = $Text -replace '%samappid%', $env:ApplicationID
+
+    if ($Text -match '%cippuserschema%') {
+        $Schema = Get-CIPPSchemaExtensions | Where-Object { $_.id -match '_cippUser' } | Select-Object -First 1
+        $Text = $Text -replace '%cippuserschema%', $Schema.id
+    }
+
+    if ($Text -match '%cippurl%') {
+        $ConfigTable = Get-CIPPTable -tablename 'Config'
+        $Config = Get-CIPPAzDataTableEntity @ConfigTable -Filter "PartitionKey eq 'InstanceProperties' and RowKey eq 'CIPPURL'"
+        if ($Config) {
+            $Text = $Text -replace '%cippurl%', $Config.Value
+        }
+    }
     return $Text
 }

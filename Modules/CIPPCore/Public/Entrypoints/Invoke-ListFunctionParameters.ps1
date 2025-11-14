@@ -1,5 +1,3 @@
-using namespace System.Net
-
 function Invoke-ListFunctionParameters {
     <#
     .FUNCTIONALITY
@@ -8,10 +6,6 @@ function Invoke-ListFunctionParameters {
         CIPP.Core.Read
     #>
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
-
     # Interact with query parameters or the body of the request.
     $Module = $Request.Query.Module
     $Function = $Request.Query.Function
@@ -77,10 +71,9 @@ function Invoke-ListFunctionParameters {
         $Results = "Function Error: $($_.Exception.Message)"
         $StatusCode = [HttpStatusCode]::BadRequest
     }
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return [HttpResponseContext]@{
             StatusCode = $StatusCode
             Body       = @($Results)
-        })
+        }
 
 }

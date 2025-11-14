@@ -1,5 +1,3 @@
-using namespace System.Net
-
 Function Invoke-ListConnectionFilter {
     <#
     .FUNCTIONALITY
@@ -9,9 +7,6 @@ Function Invoke-ListConnectionFilter {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
     $Tenantfilter = $request.Query.tenantfilter
 
     try {
@@ -23,8 +18,7 @@ Function Invoke-ListConnectionFilter {
         $Policies = $ErrorMessage
     }
 
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = $StatusCode
             Body       = @($Policies)
         })

@@ -14,7 +14,7 @@ function Invoke-CIPPStandardUserPreferredLanguage {
             Entra (AAD) Standards
         TAG
         ADDEDCOMPONENT
-            {"type":"autoComplete","multiple":false,"creatable":false,"name":"standards.UserPreferredLanguage.preferredLanguage","label":"Preferred Language","api":{"url":"/languageList.json","labelField":"language","valueField":"tag"}}
+            {"type":"autoComplete","multiple":false,"creatable":false,"name":"standards.UserPreferredLanguage.preferredLanguage","label":"Preferred Language","api":{"url":"/languageList.json","labelField":"tag","valueField":"tag"}}
         IMPACT
             High Impact
         ADDEDDATE
@@ -25,19 +25,27 @@ function Invoke-CIPPStandardUserPreferredLanguage {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards/entra-aad-standards#high-impact
+        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
     #>
 
     param($Tenant, $Settings)
 
     $preferredLanguage = $Settings.preferredLanguage.value
-    $IncorrectUsers = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/users?`$top=999&`$select=userPrincipalName,displayName,preferredLanguage,userType,onPremisesSyncEnabled&`$filter=preferredLanguage ne '$preferredLanguage' and userType eq 'Member' and onPremisesSyncEnabled ne true&`$count=true" -tenantid $Tenant -ComplexFilter
+
+    try {
+        $IncorrectUsers = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/users?`$top=999&`$select=userPrincipalName,displayName,preferredLanguage,userType,onPremisesSyncEnabled&`$filter=preferredLanguage ne '$preferredLanguage' and userType eq 'Member' and onPremisesSyncEnabled ne true&`$count=true" -tenantid $Tenant -ComplexFilter
+    }
+    catch {
+        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the UserPreferredLanguage state for $Tenant. Error: $ErrorMessage" -Sev Error
+        return
+    }
 
     if ($Settings.remediate -eq $true) {
         if (($IncorrectUsers | Measure-Object).Count -gt 0) {
             try {
                 foreach ($user in $IncorrectUsers) {
-                    $cmdparams = @{
+                    $cmdParams = @{
                         tenantid    = $Tenant
                         uri         = "https://graph.microsoft.com/beta/users/$($user.userPrincipalName)"
                         AsApp       = $true
@@ -47,7 +55,7 @@ function Invoke-CIPPStandardUserPreferredLanguage {
                         } | ConvertTo-Json
                         ContentType = 'application/json; charset=utf-8'
                     }
-                    $null = New-GraphPOSTRequest @cmdparams
+                    $null = New-GraphPOSTRequest @cmdParams
                     Write-LogMessage -API 'Standards' -tenant $Tenant -message "Preferred language for $($user.userPrincipalName) has been set to $preferredLanguage" -sev Info
                 }
             } catch {

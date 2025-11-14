@@ -1,6 +1,6 @@
 {
   "recommendations": [
-    "ms-azuretools.vscode-azurefunctions",
-    "editorconfig.editorconfig"
+    "editorconfig.editorconfig",
+    "streetsidesoftware.code-spell-checker"
   ]
 }
