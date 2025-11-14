@@ -11,8 +11,6 @@ Function Invoke-RemoveWebhookAlert {
     param($Request, $TriggerMetadata)
 
     $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
-
     try {
         $WebhookTable = Get-CIPPTable -TableName 'SchedulerConfig'
         $WebhookRow = Get-CIPPAzDataTableEntity @WebhookTable -Filter "PartitionKey eq 'WebhookAlert'" | Where-Object -Property Tenant -EQ $Request.query.TenantFilter
@@ -52,9 +50,8 @@ Function Invoke-RemoveWebhookAlert {
         $body = [pscustomobject]@{'Results' = "Failed to remove webhook alert: $($_.Exception.Message)" }
     }
 
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return [HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = $body
-        })
+        }
 }

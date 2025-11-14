@@ -1,5 +1,3 @@
-using namespace System.Net
-
 Function Invoke-ListLicenses {
     <#
     .FUNCTIONALITY
@@ -9,16 +7,8 @@ Function Invoke-ListLicenses {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
-
-
-    # Write to the Azure Functions log stream.
-    Write-Host 'PowerShell HTTP trigger function processed a request.'
-
     # Interact with query parameters or the body of the request.
-    $TenantFilter = $Request.Query.TenantFilter
+    $TenantFilter = $Request.Query.tenantFilter
     $RawGraphRequest = if ($TenantFilter -ne 'AllTenants') {
         $GraphRequest = Get-CIPPLicenseOverview -TenantFilter $TenantFilter | ForEach-Object {
             $TermInfo = $_.TermInfo | ConvertFrom-Json -ErrorAction SilentlyContinue
@@ -60,9 +50,9 @@ Function Invoke-ListLicenses {
         }
     }
 
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = @($GraphRequest)
-        }) -Clobber
+        })
 
 }

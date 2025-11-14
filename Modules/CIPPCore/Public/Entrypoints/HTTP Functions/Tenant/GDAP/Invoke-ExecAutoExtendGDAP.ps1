@@ -1,5 +1,3 @@
-using namespace System.Net
-
 Function Invoke-ExecAutoExtendGDAP {
     <#
     .FUNCTIONALITY
@@ -9,12 +7,10 @@ Function Invoke-ExecAutoExtendGDAP {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
     $Id = $Request.query.ID ?? $Request.Body.ID
     $Results = Set-CIPPGDAPAutoExtend -RelationShipid $Id
 
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = @{ Results = $Results }
         })

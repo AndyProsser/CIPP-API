@@ -2,6 +2,9 @@ function Start-UpdatePermissionsOrchestrator {
     <#
     .SYNOPSIS
     Start the Update Permissions Orchestrator
+
+    .FUNCTIONALITY
+    Entrypoint
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param()
@@ -10,9 +13,9 @@ function Start-UpdatePermissionsOrchestrator {
         Write-Information 'Updating Permissions'
 
         $PartnerTenant = @{
-            'customerId' = $env:TenantID
+            'customerId'        = $env:TenantID
             'defaultDomainName' = 'PartnerTenant'
-            'displayName' = '*Partner Tenant'
+            'displayName'       = '*Partner Tenant'
         }
 
         $TenantList = Get-Tenants -IncludeAll | Where-Object { $_.Excluded -eq $false }

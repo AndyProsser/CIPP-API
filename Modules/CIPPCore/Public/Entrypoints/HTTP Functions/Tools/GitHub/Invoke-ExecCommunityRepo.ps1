@@ -29,7 +29,7 @@ function Invoke-ExecCommunityRepo {
             Results = $Results
         }
 
-        Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+        return ([HttpResponseContext]@{
                 StatusCode = [HttpStatusCode]::OK
                 Body       = $Body
             })
@@ -107,7 +107,7 @@ function Invoke-ExecCommunityRepo {
         'UploadTemplate' {
             $GUID = $Request.Body.GUID
             $TemplateTable = Get-CIPPTable -TableName templates
-            $TemplateEntity = Get-CIPPAzDataTableEntity @TemplateTable -Filter "RowKey eq '$($GUID)'"
+            $TemplateEntity = Get-CIPPAzDataTableEntity @TemplateTable -Filter "RowKey eq '$($GUID)'" | Select-Object -ExcludeProperty ETag, Timestamp
             $Branch = $RepoEntity.UploadBranch ?? $RepoEntity.DefaultBranch
             if ($TemplateEntity) {
                 $Template = $TemplateEntity.JSON | ConvertFrom-Json
@@ -197,7 +197,7 @@ function Invoke-ExecCommunityRepo {
         Results = @($Results)
     }
 
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = $Body
         })

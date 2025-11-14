@@ -1,18 +1,12 @@
-using namespace System.Net
-
 Function Invoke-ListExtensionsConfig {
     <#
     .FUNCTIONALITY
-        Entrypoint
+        Entrypoint,AnyTenant
     .ROLE
         CIPP.Extension.Read
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
-
     $Table = Get-CIPPTable -TableName Extensionsconfig
     try {
         $Body = (Get-CIPPAzDataTableEntity @Table).config | ConvertFrom-Json -Depth 10 -ErrorAction Stop
@@ -33,10 +27,9 @@ Function Invoke-ListExtensionsConfig {
         Write-Information (Get-CippException -Exception $_ | ConvertTo-Json)
         $Body = @{}
     }
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return [HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = $body
-        })
+        }
 
 }

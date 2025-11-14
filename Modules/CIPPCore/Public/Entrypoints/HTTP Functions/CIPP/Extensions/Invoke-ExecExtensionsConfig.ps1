@@ -1,6 +1,4 @@
-using namespace System.Net
-
-Function Invoke-ExecExtensionsConfig {
+function Invoke-ExecExtensionsConfig {
     <#
     .FUNCTIONALITY
         Entrypoint
@@ -9,10 +7,8 @@ Function Invoke-ExecExtensionsConfig {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
     $Headers = $Request.Headers
-    Write-LogMessage -headers $Headers -API $APIName -message 'Accessed this API' -Sev 'Debug'
+
 
     $Body = [PSCustomObject]$Request.Body
     $Results = try {
@@ -31,6 +27,14 @@ Function Invoke-ExecExtensionsConfig {
             }
         }
 
+        if ($Body.Hudu.NextSync) {
+            #parse unixtime for addedtext
+            $Timestamp = [datetime]::UnixEpoch.AddSeconds([int]$Body.Hudu.NextSync).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            Register-CIPPExtensionScheduledTasks -Reschedule -NextSync $Body.Hudu.NextSync -Extensions 'Hudu'
+            $AddedText = " Next sync will be at $Timestamp."
+            $Body.Hudu.NextSync = ''
+        }
+
         $Table = Get-CIPPTable -TableName Extensionsconfig
         foreach ($APIKey in $Body.PSObject.Properties.Name) {
             Write-Information "Working on $apikey"
@@ -38,7 +42,7 @@ Function Invoke-ExecExtensionsConfig {
                 Write-Information 'Not sending to keyvault. Key previously set or left blank.'
             } else {
                 Write-Information 'writing API Key to keyvault, and clearing.'
-                Write-Information "$ENV:WEBSITE_DEPLOYMENT_ID"
+                Write-Information "$env:WEBSITE_DEPLOYMENT_ID"
                 if ($Body.$APIKey.APIKey) {
                     Set-ExtensionAPIKey -Extension $APIKey -APIKey $Body.$APIKey.APIKey
                 }
@@ -77,8 +81,7 @@ Function Invoke-ExecExtensionsConfig {
 
 
 
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = @{'Results' = $Results }
         })

@@ -1,5 +1,3 @@
-using namespace System.Net
-
 Function Invoke-ListBPATemplates {
     <#
     .FUNCTIONALITY
@@ -9,12 +7,6 @@ Function Invoke-ListBPATemplates {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
-
-    Write-Host 'PowerShell HTTP trigger function processed a request.'
-
     $Table = Get-CippTable -tablename 'templates'
 
     $Templates = Get-ChildItem 'Config\*.BPATemplate.json' | ForEach-Object {
@@ -35,7 +27,7 @@ Function Invoke-ListBPATemplates {
         foreach ($Template in $Templates) {
             $Template.JSON = $Template.JSON -replace '"parameters":', '"Parameters":'
         }
-        $Templates = $Templates.JSON | ConvertFrom-Json
+        $Templates = $Templates.JSON | ConvertFrom-Json | Sort-Object Name
     } else {
         $Templates = $Templates | ForEach-Object {
             $TemplateJson = $_.JSON -replace '"parameters":', '"Parameters":'
@@ -46,10 +38,9 @@ Function Invoke-ListBPATemplates {
                 Name  = $Template.Name
                 Style = $Template.Style
             }
-        }
+        } | Sort-Object Name
     }
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = ($Templates | ConvertTo-Json -Depth 10)
         })

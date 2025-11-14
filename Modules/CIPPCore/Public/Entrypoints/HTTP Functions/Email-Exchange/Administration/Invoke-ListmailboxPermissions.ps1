@@ -1,5 +1,3 @@
-using namespace System.Net
-
 Function Invoke-ListmailboxPermissions {
     <#
     .FUNCTIONALITY
@@ -9,10 +7,6 @@ Function Invoke-ListmailboxPermissions {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    Write-LogMessage -headers $Request.Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
-
     # Interact with query parameters or the body of the request.
     $TenantFilter = $Request.Query.tenantFilter
     $UserID = $Request.Query.userId
@@ -69,8 +63,7 @@ Function Invoke-ListmailboxPermissions {
         $StatusCode = [HttpStatusCode]::Forbidden
         $GraphRequest = $ErrorMessage
     }
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = $StatusCode
             Body       = @($GraphRequest)
         })

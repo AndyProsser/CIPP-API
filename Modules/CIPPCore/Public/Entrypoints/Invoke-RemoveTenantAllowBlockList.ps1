@@ -1,6 +1,4 @@
-using namespace System.Net
-
-Function Invoke-RemoveTenantAllowBlockList {
+function Invoke-RemoveTenantAllowBlockList {
     <#
     .FUNCTIONALITY
         Entrypoint
@@ -11,11 +9,11 @@ Function Invoke-RemoveTenantAllowBlockList {
     param($Request, $TriggerMetadata)
 
     $APIName = $Request.Params.CIPPEndpoint
-    $TenantFilter = $Request.Body.tenantFilter
     $Headers = $Request.Headers
-    Write-LogMessage -headers $Headers -API $APIName -message 'Accessed this API' -Sev 'Debug'
+
 
     # Interact with query parameters or the body of the request.
+    $TenantFilter = $Request.Body.tenantFilter
     $Entries = $Request.Body.Entries
     $ListType = $Request.Body.ListType
 
@@ -44,8 +42,7 @@ Function Invoke-RemoveTenantAllowBlockList {
         $StatusCode = [HttpStatusCode]::Forbidden
     }
 
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = $StatusCode
             Body       = @{
                 'Results' = $Result
