@@ -19,7 +19,6 @@ function Start-DurableCleanup {
     )
 
     $WarningPreference = 'SilentlyContinue'
-    $StorageContext = New-AzStorageContext -ConnectionString $env:AzureWebJobsStorage
     $TargetTime = (Get-Date).ToUniversalTime().AddSeconds(-$MaxDuration)
     $Context = New-AzDataTableContext -ConnectionString $env:AzureWebJobsStorage
     $InstancesTables = Get-AzDataTable -Context $Context | Where-Object { $_ -match 'Instances' }

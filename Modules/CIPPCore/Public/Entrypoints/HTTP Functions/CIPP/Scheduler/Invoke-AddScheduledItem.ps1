@@ -32,12 +32,11 @@ function Invoke-AddScheduledItem {
         $ScheduledTask = @{
             Task                  = $Request.Body
             Headers               = $Request.Headers
-            hidden                = $hidden
+            Hidden                = $hidden
             DisallowDuplicateName = $Request.Query.DisallowDuplicateName
             DesiredStartTime      = $Request.Body.DesiredStartTime
         }
         $Result = Add-CIPPScheduledTask @ScheduledTask
-        Write-LogMessage -headers $Request.Headers -API $APINAME -message $Result -Sev 'Info'
     }
     return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
