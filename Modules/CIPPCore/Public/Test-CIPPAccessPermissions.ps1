@@ -25,7 +25,6 @@ function Test-CIPPAccessPermissions {
     }
     $Success = $true
     try {
-        Set-Location (Get-Item $PSScriptRoot).FullName
         $null = Get-CIPPAuthentication
         $GraphToken = Get-GraphToken -returnRefresh $true -SkipCache $true
         if ($GraphToken) {
@@ -33,13 +32,8 @@ function Test-CIPPAccessPermissions {
         }
         if ($env:MSI_SECRET) {
             try {
-                Disable-AzContextAutosave -Scope Process | Out-Null
-                $null = Connect-AzAccount -Identity
-                $SubscriptionId = $env:WEBSITE_OWNER_NAME -split '\+' | Select-Object -First 1
-                $null = Set-AzContext -SubscriptionId $SubscriptionId
-
                 $KV = $env:WEBSITE_DEPLOYMENT_ID
-                $KeyVaultRefresh = Get-AzKeyVaultSecret -VaultName $kv -Name 'RefreshToken' -AsPlainText
+                $KeyVaultRefresh = Get-CippKeyVaultSecret -VaultName $kv -Name 'RefreshToken' -AsPlainText
                 if ($env:RefreshToken -ne $KeyVaultRefresh) {
                     $Success = $false
                     $ErrorMessages.Add('Your refresh token does not match key vault, wait 30 minutes for the function app to update.') | Out-Null
