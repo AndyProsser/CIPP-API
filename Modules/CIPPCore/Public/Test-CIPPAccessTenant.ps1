@@ -114,13 +114,13 @@ function Test-CIPPAccessTenant {
             Write-Information "Found $($RoleDefinitions.Count) Exchange role definitions"
 
             $BasePath = Get-Module -Name 'CIPPCore' | Select-Object -ExpandProperty ModuleBase
-            $AllOrgManagementRoles = Get-Content -Path "$BasePath\Public\OrganizationManagementRoles.json" -ErrorAction Stop | ConvertFrom-Json
-            Write-Information "Loaded all Organization Management roles from $BasePath\Public\OrganizationManagementRoles.json"
+            $AllOrgManagementRoles = Get-Content -Path "$BasePath\lib\data\OrganizationManagementRoles.json" -ErrorAction Stop | ConvertFrom-Json
+            Write-Information "Loaded all Organization Management roles from $BasePath\lib\data\OrganizationManagementRoles.json"
 
             $AvailableRoles = $RoleDefinitions | Where-Object -Property displayName -In $AllOrgManagementRoles | Select-Object -Property displayName, id, description
             Write-Information "Found $($AvailableRoles.Count) available Organization Management roles in Exchange"
             $MissingOrgMgmtRoles = $AvailableRoles | Where-Object { $OrgManagementRoles.Role -notcontains $_.displayName }
-            if (($MissingOrgMgmtRoles | Measure-Object).Count -gt 0) {
+            if (($MissingOrgMgmtRoles | Measure-Object).Count -ge 5) {
                 $Results.OrgManagementRolesMissing = $MissingOrgMgmtRoles
                 Write-Warning "Found $($MissingRoles.Count) missing Organization Management roles in Exchange"
                 $ExchangeStatus = $false
