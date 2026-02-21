@@ -77,20 +77,11 @@ function New-CIPPGroup {
             $null
         }
 
-        # Extract local part of username if exists and remove special characters for mailNickname
-        if ($GroupObject.username -like '*@*') {
-            $MailNickname = ($GroupObject.username -split '@')[0]
+        # Determine if we should generate a mailNickname with a GUID, or use the username field
+        if (-not $GroupObject.Username) {
+            $MailNickname = (New-Guid).guid.substring(0, 10)
         } else {
-            $MailNickname = $GroupObject.username
-        }
-
-        # Remove forbidden characters per Microsoft 365 mailNickname requirements:
-        # ASCII 0-127 only, excluding: @ () / [] ' ; : <> , SPACE and any non-ASCII
-        $MailNickname = $MailNickname -replace "[@()\[\]/'`;:<>,\s]|[^\x00-\x7F]", ''
-
-        # Ensure max length of 64 characters
-        if ($MailNickname.Length -gt 64) {
-            $MailNickname = $MailNickname.Substring(0, 64)
+            $MailNickname = $GroupObject.Username
         }
 
         Write-LogMessage -API $APIName -tenant $TenantFilter -message "Creating group $($GroupObject.displayName) of type $NormalizedGroupType$(if ($NeedsEmail) { " with email $Email" })" -Sev Info
@@ -167,7 +158,15 @@ function New-CIPPGroup {
                 GroupType = $NormalizedGroupType
                 Email     = if ($NeedsEmail) { $Email } else { $null }
             }
-
+            if ($GroupObject.subscribeMembers) {
+                #Waiting for group to become available in Exo.
+                Start-Sleep -Seconds 10
+                $SubParams = @{
+                    Identity                  = $GraphRequest.id
+                    'autoSubscribeNewMembers' = $true
+                }
+                $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Set-UnifiedGroup' -cmdParams $SubParams
+            }
         } else {
             # Handle Exchange Online groups (Distribution, DynamicDistribution)
 
