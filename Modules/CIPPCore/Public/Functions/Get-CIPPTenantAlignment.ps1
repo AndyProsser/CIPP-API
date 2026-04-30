@@ -24,16 +24,18 @@ function Get-CIPPTenantAlignment {
         [Parameter(Mandatory = $false)]
         [string]$TemplateId
     )
+    $TemplateTable = Get-CippTable -tablename 'templates'
+    $TemplateFilter = "PartitionKey eq 'StandardsTemplateV2'"
+    $TenantGroups = Get-TenantGroups
+    $DriftTable = Get-CippTable -tablename 'tenantDrift'
 
     try {
         # Get all standard templates
-        $TemplateTable = Get-CippTable -tablename 'templates'
-        $TemplateFilter = "PartitionKey eq 'StandardsTemplateV2'"
-
         $Templates = (Get-CIPPAzDataTableEntity @TemplateTable -Filter $TemplateFilter) | ForEach-Object {
-            $JSON = $_.JSON -replace '"Action":', '"action":'
+            $JSON = $_.JSON
             try {
                 $RowKey = $_.RowKey
+                if ([string]::IsNullOrWhiteSpace($JSON)) { return }
                 $Data = $JSON | ConvertFrom-Json -Depth 100 -ErrorAction Stop
             } catch {
                 Write-Warning "$($RowKey) standard could not be loaded: $($_.Exception.Message)"
@@ -51,19 +53,25 @@ function Get-CIPPTenantAlignment {
         }
 
         # Get standards comparison data
-        $StandardsTable = Get-CIPPTable -TableName 'CippStandardsReports'
-        $AllStandards = Get-CIPPAzDataTableEntity @StandardsTable -Filter "PartitionKey ne 'StandardReport' and PartitionKey ne ''"
+        $StandardsTable = Get-CippTable -TableName 'CippStandardsReports'
+        #this if statement is to bring down performance when running scheduled checks, we have to revisit this to a better query due to the extreme size this can get.
+        if ($TenantFilter) {
+            $filter = "PartitionKey eq '$TenantFilter'"
+        } else {
+            $filter = "PartitionKey ne 'StandardReport' and PartitionKey ne ''"
+        }
+        $AllStandards = Get-CIPPAzDataTableEntity @StandardsTable -Filter $filter
 
         # Filter by tenant if specified
         $Standards = if ($TenantFilter) {
-            $AllStandards | Where-Object { $_.PartitionKey -eq $TenantFilter }
+            $AllStandards
         } else {
             $Tenants = Get-Tenants -IncludeErrors
             $AllStandards | Where-Object { $_.PartitionKey -in $Tenants.defaultDomainName }
         }
-
+        $TagTemplates = Get-CIPPAzDataTableEntity @TemplateTable
         # Build tenant standards data structure
-        $TenantStandards = @{}
+        $tenantData = @{}
         foreach ($Standard in $Standards) {
             $FieldName = $Standard.RowKey
             $FieldValue = $Standard.Value
@@ -72,30 +80,29 @@ function Get-CIPPTenantAlignment {
             # Process field value
             if ($FieldValue -is [System.Boolean]) {
                 $FieldValue = [bool]$FieldValue
-            } elseif (Test-Json -Json $FieldValue -ErrorAction SilentlyContinue) {
-                try {
-                    $FieldValue = ConvertFrom-Json -Depth 100 -InputObject $FieldValue -ErrorAction Stop
-                } catch {
-                    Write-Warning "$($FieldName) standard report could not be loaded: $($_.Exception.Message)"
-                    $FieldValue = [PSCustomObject]@{
-                        Error         = "Invalid JSON format: $($_.Exception.Message)"
-                        OriginalValue = $FieldValue
-                    }
-                }
             } else {
-                $FieldValue = [string]$FieldValue
+                try {
+                    $FieldValue = ConvertFrom-Json -Depth 5 -InputObject $FieldValue -ErrorAction Stop
+                } catch {
+                    $FieldValue = [string]$FieldValue
+                }
             }
 
-            if (-not $TenantStandards.ContainsKey($Tenant)) {
-                $TenantStandards[$Tenant] = @{}
+            if ($Tenant -and -not $tenantData.ContainsKey($Tenant)) {
+                $tenantData[$Tenant] = @{}
             }
-            $TenantStandards[$Tenant][$FieldName] = @{
-                Value       = $FieldValue
-                LastRefresh = $Standard.TimeStamp.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            $tenantData[$Tenant][$FieldName] = @{
+                Value            = $FieldValue
+                LastRefresh      = $Standard.TimeStamp.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                LicenseAvailable = $Standard.LicenseAvailable
+                CurrentValue     = $Standard.CurrentValue
+                ExpectedValue    = $Standard.ExpectedValue
             }
         }
+        $TenantStandards = $tenantData
 
         $Results = [System.Collections.Generic.List[object]]::new()
+        $TenantDriftStatusesCache = @{}
 
         # Process each template against all tenants
         foreach ($Template in $Templates) {
@@ -108,20 +115,55 @@ function Get-CIPPTenantAlignment {
             $TemplateAssignedTenants = @()
             $AppliestoAllTenants = $false
 
+            # Build excluded tenants list (mirrors Get-CIPPStandards logic, including group expansion)
+            $ExcludedTenantValues = [System.Collections.Generic.List[string]]::new()
+            if ($Template.excludedTenants) {
+                $ExcludeList = if ($Template.excludedTenants -is [System.Collections.IEnumerable] -and -not ($Template.excludedTenants -is [string])) {
+                    $Template.excludedTenants
+                } else {
+                    @($Template.excludedTenants)
+                }
+                foreach ($excludeItem in $ExcludeList) {
+                    $ExcludeValue = $excludeItem.value
+                    if ($excludeItem.type -eq 'Group') {
+                        $GroupMembers = $TenantGroups | Where-Object { $_.Id -eq $ExcludeValue }
+                        if ($GroupMembers -and $GroupMembers.Members) {
+                            foreach ($member in $GroupMembers.Members.defaultDomainName) {
+                                $ExcludedTenantValues.Add($member)
+                            }
+                        }
+                    } else {
+                        if ($ExcludeValue) { $ExcludedTenantValues.Add($ExcludeValue) }
+                    }
+                }
+            }
+            $ExcludedTenantsSet = [System.Collections.Generic.HashSet[string]]::new()
+            foreach ($item in $ExcludedTenantValues) { [void]$ExcludedTenantsSet.Add($item) }
+
             if ($Template.tenantFilter -and $Template.tenantFilter.Count -gt 0) {
                 # Extract tenant values from the tenantFilter array
-                $TenantValues = $Template.tenantFilter | ForEach-Object {
-                    if ($_.type -eq 'group') {
-                        (Get-TenantGroups -GroupId $_.value).members.defaultDomainName
+                $TenantValues = [System.Collections.Generic.List[string]]::new()
+                foreach ($filterItem in $Template.tenantFilter) {
+                    if ($filterItem.type -eq 'Group') {
+                        # Look up group members by Id (GUID in the value field)
+                        $GroupMembers = $TenantGroups | Where-Object { $_.Id -eq $filterItem.value }
+                        if ($GroupMembers -and $GroupMembers.Members) {
+                            foreach ($member in $GroupMembers.Members.defaultDomainName) {
+                                $TenantValues.Add($member)
+                            }
+                        }
                     } else {
-                        $_.value
+                        $TenantValues.Add($filterItem.value)
                     }
                 }
 
                 if ($TenantValues -contains 'AllTenants') {
                     $AppliestoAllTenants = $true
+                } elseif ($TenantValues.Count -gt 0) {
+                    $TemplateAssignedTenants = @($TenantValues)
                 } else {
-                    $TemplateAssignedTenants = $TenantValues
+                    # Filter was specified but resolved to no tenants (empty group) - skip this template
+                    continue
                 }
             } else {
                 $AppliestoAllTenants = $true
@@ -152,26 +194,25 @@ function Get-CIPPTenantAlignment {
                             $IntuneStandardId = "standards.IntuneTemplate.$($IntuneTemplate.TemplateList.value)"
                             $IntuneActions = if ($IntuneTemplate.action) { $IntuneTemplate.action } else { @() }
                             $IntuneReportingEnabled = ($IntuneActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
-
                             [PSCustomObject]@{
                                 StandardId       = $IntuneStandardId
                                 ReportingEnabled = $IntuneReportingEnabled
                             }
                         }
+
                         if ($IntuneTemplate.'TemplateList-Tags') {
                             foreach ($Tag in $IntuneTemplate.'TemplateList-Tags') {
                                 Write-Host "Processing Intune Tag: $($Tag.value)"
                                 $IntuneActions = if ($IntuneTemplate.action) { $IntuneTemplate.action } else { @() }
                                 $IntuneReportingEnabled = ($IntuneActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
-                                $TemplatesList = Get-CIPPAzDataTableEntity @TemplateTable -Filter $Filter | Where-Object -Property package -EQ $Tag.value
-                                $TemplatesList | ForEach-Object {
+                                $TagTemplate = $TagTemplates | Where-Object -Property package -EQ $Tag.value
+                                $TagTemplate | ForEach-Object {
                                     $TagStandardId = "standards.IntuneTemplate.$($_.GUID)"
                                     [PSCustomObject]@{
                                         StandardId       = $TagStandardId
                                         ReportingEnabled = $IntuneReportingEnabled
                                     }
                                 }
-
                             }
                         }
                     }
@@ -190,6 +231,20 @@ function Get-CIPPTenantAlignment {
                             }
                         }
                     }
+                }
+                # Handle QuarantineTemplate — each policy is keyed by hex-encoded display name
+                elseif ($StandardKey -eq 'QuarantineTemplate' -and $StandardConfig -is [array]) {
+                    foreach ($QTemplate in $StandardConfig) {
+                        $PolicyDisplayName = if ($QTemplate.displayName.value) { $QTemplate.displayName.value } else { [string]$QTemplate.displayName }
+                        if ([string]::IsNullOrWhiteSpace($PolicyDisplayName)) { continue }
+                        $HexName = -join ($PolicyDisplayName.ToCharArray() | ForEach-Object { '{0:X2}' -f [int][char]$_ })
+                        $QActions = if ($QTemplate.action) { $QTemplate.action } else { @() }
+                        $QReportingEnabled = ($QActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
+                        [PSCustomObject]@{
+                            StandardId       = "standards.QuarantineTemplate.$HexName"
+                            ReportingEnabled = $QReportingEnabled
+                        }
+                    }
                 } else {
                     [PSCustomObject]@{
                         StandardId       = $StandardId
@@ -199,22 +254,70 @@ function Get-CIPPTenantAlignment {
             }
 
             $AllStandards = $StandardsData.StandardId
-            $ReportingEnabledStandards = ($StandardsData | Where-Object { $_.ReportingEnabled }).StandardId
+            $AllStandardsArray = @($AllStandards)
             $ReportingDisabledStandards = ($StandardsData | Where-Object { -not $_.ReportingEnabled }).StandardId
+            $ReportingDisabledSet = [System.Collections.Generic.HashSet[string]]::new()
+            foreach ($item in $ReportingDisabledStandards) { [void]$ReportingDisabledSet.Add($item) }
+            $TemplateAssignedTenantsSet = if ($TemplateAssignedTenants.Count -gt 0) {
+                $set = [System.Collections.Generic.HashSet[string]]::new()
+                foreach ($item in $TemplateAssignedTenants) { [void]$set.Add($item) }
+                $set
+            } else { $null }
 
             foreach ($TenantName in $TenantStandards.Keys) {
-                if (-not $AppliestoAllTenants -and $TenantName -notin $TemplateAssignedTenants) {
+                # Skip explicitly excluded tenants regardless of AllTenants or specific assignment
+                if ($ExcludedTenantsSet.Contains($TenantName)) {
                     continue
+                }
+                # Check tenant scope with HashSet and cache tenant data
+                if (-not $AppliestoAllTenants) {
+                    if ($TemplateAssignedTenantsSet -and -not $TemplateAssignedTenantsSet.Contains($TenantName)) {
+                        continue
+                    }
                 }
 
                 $AllCount = $AllStandards.Count
                 $LatestDataCollection = $null
+                # Cache hashtable lookup
+                $CurrentTenantStandards = $TenantStandards[$TenantName]
+                $IsDriftTemplate = $Template.type -eq 'drift'
 
-                $ComparisonTable = foreach ($StandardKey in $AllStandards) {
-                    $IsReportingDisabled = $ReportingDisabledStandards -contains $StandardKey
+                # Load tenant drift deviation statuses once per tenant (used for drift score normalization)
+                $TenantDriftStatuses = @{}
+                if ($IsDriftTemplate) {
+                    if (-not $TenantDriftStatusesCache.ContainsKey($TenantName)) {
+                        try {
+                            $DriftFilter = "PartitionKey eq '$TenantName'"
+                            $DriftEntities = Get-CIPPAzDataTableEntity @DriftTable -Filter $DriftFilter
+                            foreach ($DriftEntity in $DriftEntities) {
+                                if ($DriftEntity.StandardName) {
+                                    $TenantDriftStatuses[$DriftEntity.StandardName] = $DriftEntity.Status
+                                }
+                            }
+                        } catch {
+                            Write-Warning "Failed to get drift states for $TenantName $($_.Exception.Message)"
+                        }
+                        $TenantDriftStatusesCache[$TenantName] = $TenantDriftStatuses
+                    } else {
+                        $TenantDriftStatuses = $TenantDriftStatusesCache[$TenantName]
+                    }
+                }
 
-                    if ($TenantStandards[$TenantName].ContainsKey($StandardKey)) {
-                        $StandardObject = $TenantStandards[$TenantName][$StandardKey]
+                # Pre-allocate list with capacity
+                $ComparisonResults = [System.Collections.Generic.List[object]]::new($AllStandardsArray.Count)
+
+                # Use for loop instead of foreach
+                for ($i = 0; $i -lt $AllStandardsArray.Count; $i++) {
+                    $StandardKey = $AllStandardsArray[$i]
+
+                    # Use HashSet for Contains
+                    $IsReportingDisabled = $ReportingDisabledSet.Contains($StandardKey)
+                    # Use cached tenant data
+
+                    $HasStandard = $StandardKey -and $CurrentTenantStandards.ContainsKey($StandardKey)
+
+                    if ($HasStandard) {
+                        $StandardObject = $CurrentTenantStandards[$StandardKey]
                         $Value = $StandardObject.Value
 
                         if ($StandardObject.LastRefresh) {
@@ -224,47 +327,99 @@ function Get-CIPPTenantAlignment {
                             }
                         }
 
-                        $IsCompliant = ($Value -eq $true)
+                        $IsCompliant = ($Value -eq $true) -or ($StandardObject.CurrentValue -and $StandardObject.CurrentValue -eq $StandardObject.ExpectedValue)
                         $IsLicenseMissing = ($Value -is [string] -and $Value -like 'License Missing:*')
 
-                        if ($IsReportingDisabled) {
-                            $ComplianceStatus = 'Reporting Disabled'
+                        $ComplianceStatus = if ($IsReportingDisabled) {
+                            'Reporting Disabled'
                         } elseif ($IsCompliant) {
-                            $ComplianceStatus = 'Compliant'
+                            'Compliant'
                         } elseif ($IsLicenseMissing) {
-                            $ComplianceStatus = 'License Missing'
+                            'License Missing'
                         } else {
-                            $ComplianceStatus = 'Non-Compliant'
+                            'Non-Compliant'
                         }
 
-                        [PSCustomObject]@{
-                            StandardName      = $StandardKey
-                            Compliant         = $IsCompliant
-                            StandardValue     = ($Value | ConvertTo-Json -Depth 100 -Compress)
-                            ComplianceStatus  = $ComplianceStatus
-                            ReportingDisabled = $IsReportingDisabled
-                        }
+                        $StandardValueJson = $Value | ConvertTo-Json -Depth 5 -Compress
+
+                        $ComparisonResults.Add([PSCustomObject]@{
+                                StandardName      = $StandardKey
+                                Compliant         = $IsCompliant
+                                StandardValue     = $StandardValueJson
+                                ComplianceStatus  = $ComplianceStatus
+                                ReportingDisabled = $IsReportingDisabled
+                                LicenseAvailable  = $StandardObject.LicenseAvailable
+                                CurrentValue      = $StandardObject.CurrentValue
+                                ExpectedValue     = $StandardObject.ExpectedValue
+                            })
                     } else {
-                        if ($IsReportingDisabled) {
-                            $ComplianceStatus = 'Reporting Disabled'
+                        $ComplianceStatus = if ($IsReportingDisabled) {
+                            'Reporting Disabled'
                         } else {
-                            $ComplianceStatus = 'Non-Compliant'
+                            'Non-Compliant'
                         }
 
-                        [PSCustomObject]@{
-                            StandardName      = $StandardKey
-                            Compliant         = $false
-                            StandardValue     = 'NOT FOUND'
-                            ComplianceStatus  = $ComplianceStatus
-                            ReportingDisabled = $IsReportingDisabled
-                        }
+                        $ComparisonResults.Add([PSCustomObject]@{
+                                StandardName      = $StandardKey
+                                Compliant         = $false
+                                StandardValue     = 'NOT FOUND'
+                                ComplianceStatus  = $ComplianceStatus
+                                ReportingDisabled = $IsReportingDisabled
+                                LicenseAvailable  = $null
+                                CurrentValue      = $null
+                                ExpectedValue     = $null
+                            })
                     }
                 }
 
-                $CompliantStandards = ($ComparisonTable | Where-Object { $_.ComplianceStatus -eq 'Compliant' }).Count
-                $NonCompliantStandards = ($ComparisonTable | Where-Object { $_.ComplianceStatus -eq 'Non-Compliant' }).Count
-                $LicenseMissingStandards = ($ComparisonTable | Where-Object { $_.ComplianceStatus -eq 'License Missing' }).Count
-                $ReportingDisabledStandardsCount = ($ComparisonTable | Where-Object { $_.ReportingDisabled }).Count
+                # Replace Where-Object with direct counting
+                $CompliantStandards = 0
+                $NonCompliantStandards = 0
+                $LicenseMissingStandards = 0
+                $ReportingDisabledStandardsCount = 0
+
+                foreach ($item in $ComparisonResults) {
+                    $IsAcceptedDeviation = $false
+                    $DeviationStatus = $null
+                    if ($IsDriftTemplate -and $item.ComplianceStatus -eq 'Non-Compliant') {
+                        $DeviationStatus = $TenantDriftStatuses[$item.StandardName]
+                        $IsAcceptedDeviation = $DeviationStatus -in @('Accepted', 'CustomerSpecific')
+                    }
+
+                    # Update the item's compliance status and add deviation info for granular consumers
+                    if ($IsAcceptedDeviation) {
+                        $item.ComplianceStatus = if ($DeviationStatus -eq 'Accepted') { 'Accepted Deviation' } else { 'Customer Specific' }
+                    }
+                    if ($DeviationStatus) {
+                        $item | Add-Member -NotePropertyName 'DeviationStatus' -NotePropertyValue $DeviationStatus -Force
+                    }
+
+                    if ($item.ComplianceStatus -in @('Compliant', 'Accepted Deviation', 'Customer Specific')) { $CompliantStandards++ }
+                    elseif ($item.ComplianceStatus -eq 'Non-Compliant') { $NonCompliantStandards++ }
+                    elseif ($item.ComplianceStatus -eq 'License Missing') { $LicenseMissingStandards++ }
+                    if ($item.ReportingDisabled) { $ReportingDisabledStandardsCount++ }
+                }
+
+                # For drift templates, include all policy deviation entries from tenantDrift table in alignment score
+                # Accepted/CustomerSpecific count as compliant, all others (New, Denied, etc.) count as non-compliant
+                $CurrentDeviationsCount = $null
+                if ($IsDriftTemplate) {
+                    $PolicyDeviationCompliant = 0
+                    $PolicyDeviationNonCompliant = 0
+                    foreach ($DriftKey in $TenantDriftStatuses.Keys) {
+                        if ($DriftKey -like 'IntuneTemplates.*' -or $DriftKey -like 'ConditionalAccessTemplates.*') {
+                            if ($TenantDriftStatuses[$DriftKey] -in @('Accepted', 'CustomerSpecific')) {
+                                $PolicyDeviationCompliant++
+                            } else {
+                                $PolicyDeviationNonCompliant++
+                            }
+                        }
+                    }
+                    $AllCount += $PolicyDeviationCompliant + $PolicyDeviationNonCompliant
+                    $CompliantStandards += $PolicyDeviationCompliant
+                    $NonCompliantStandards += $PolicyDeviationNonCompliant
+                    $CurrentDeviationsCount = $PolicyDeviationNonCompliant
+                }
 
                 $AlignmentPercentage = if (($AllCount - $ReportingDisabledStandardsCount) -gt 0) {
                     [Math]::Round(($CompliantStandards / ($AllCount - $ReportingDisabledStandardsCount)) * 100)
@@ -286,6 +441,7 @@ function Get-CIPPTenantAlignment {
                     standardSettings         = $Template.Standards
                     driftAlertEmail          = $Template.driftAlertEmail
                     driftAlertWebhook        = $Template.driftAlertWebhook
+                    driftAlertDisableEmail   = $Template.driftAlertDisableEmail
                     AlignmentScore           = $AlignmentPercentage
                     LicenseMissingPercentage = $LicenseMissingPercentage
                     CombinedScore            = $AlignmentPercentage + $LicenseMissingPercentage
@@ -294,8 +450,9 @@ function Get-CIPPTenantAlignment {
                     LicenseMissingStandards  = $LicenseMissingStandards
                     TotalStandards           = $AllCount
                     ReportingDisabledCount   = $ReportingDisabledStandardsCount
+                    CurrentDeviationsCount   = $CurrentDeviationsCount
                     LatestDataCollection     = if ($LatestDataCollection) { $LatestDataCollection } else { $null }
-                    ComparisonDetails        = $ComparisonTable
+                    ComparisonDetails        = $ComparisonResults
                 }
 
                 $Results.Add($Result)
