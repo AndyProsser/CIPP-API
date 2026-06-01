@@ -23,16 +23,14 @@ function Get-CippAllowedPermissions {
 
     # Get all available permissions and base roles configuration
 
-    $CIPPCoreModuleRoot = Get-Module -Name CIPPCore | Select-Object -ExpandProperty ModuleBase
-    $CIPPRoot = (Get-Item $CIPPCoreModuleRoot).Parent.Parent
-    $Version = (Get-Content -Path $CIPPRoot\version_latest.txt).trim()
-    $BaseRoles = Get-Content -Path $CIPPRoot\Config\cipp-roles.json | ConvertFrom-Json
+    $Version = (Get-Content -Path (Join-Path $env:CIPPRootPath 'Config\version_latest.txt')).trim()
+    $BaseRoles = Get-Content -Path (Join-Path $env:CIPPRootPath 'Config\cipp-roles.json') | ConvertFrom-Json
     $DefaultRoles = @('superadmin', 'admin', 'editor', 'readonly', 'anonymous', 'authenticated')
 
     $AllPermissionCacheTable = Get-CIPPTable -tablename 'cachehttppermissions'
     $AllPermissionsRow = Get-CIPPAzDataTableEntity @AllPermissionCacheTable -Filter "PartitionKey eq 'HttpFunctions' and RowKey eq 'HttpFunctions' and Version eq '$($Version)'"
 
-    if (-not $AllPermissionsRow) {
+    if (-not $AllPermissionsRow.Permissions) {
         $AllPermissions = Get-CIPPHttpFunctions -ByRole | Select-Object -ExpandProperty Permission
         $Entity = @{
             PartitionKey = 'HttpFunctions'
