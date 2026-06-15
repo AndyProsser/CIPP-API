@@ -14,15 +14,15 @@ function New-CIPPUserTask {
         $Results.Add("Username: $($CreationResults.Username)")
         $Results.Add("Password: $($CreationResults.Password)")
     } catch {
-        $Results.Add("Failed to create user. $($_.Exception.Message)" )
-        return @{'Results' = $Results }
+        $Results.Add("$($_.Exception.Message)" )
+        throw @{'Results' = $Results }
     }
 
     try {
         if ($UserObj.licenses.value) {
             if ($UserObj.sherwebLicense.value) {
-                $License = Set-SherwebSubscription -Headers $Headers -TenantFilter $UserObj.tenantFilter -SKU $UserObj.sherwebLicense.value -Add 1
-                $null = $results.Add('Added Sherweb License, scheduling assignment')
+                $null = Set-SherwebSubscription -Headers $Headers -TenantFilter $UserObj.tenantFilter -SKU $UserObj.sherwebLicense.value -Add 1
+                $null = $Results.Add('Added Sherweb License, scheduling assignment')
                 $taskObject = [PSCustomObject]@{
                     TenantFilter  = $UserObj.tenantFilter
                     Name          = "Assign License: $UserPrincipalName"
@@ -68,14 +68,54 @@ function New-CIPPUserTask {
         $CopyFrom.Error | ForEach-Object { $Results.Add($_) }
     }
 
+    # Add to groups
+    if ($UserObj.AddToGroups) {
+        $ExoGroupTypes = @('Distribution list', 'Mail-Enabled Security')
+        $UserObj.AddToGroups | ForEach-Object {
+            $Group = $_
+            $GroupType = $Group.addedFields.groupType
+            try {
+                $AddMemberResult = Add-CIPPGroupMember -Headers $Headers -GroupType $GroupType -GroupId $Group.value -Member @($CreationResults.Username) -TenantFilter $UserObj.tenantFilter
+                $Results.Add($AddMemberResult)
+            } catch {
+                # EXO group adds frequently fail right after user creation due to Exchange directory replication lag.
+                # Schedule a delayed retry so the user lands in the group automatically once EXO sees the recipient.
+                if ($GroupType -in $ExoGroupTypes) {
+                    try {
+                        $TaskBody = [PSCustomObject]@{
+                            TenantFilter  = $UserObj.tenantFilter
+                            Name          = "Retry Add Group Member: $($CreationResults.Username) -> $($Group.label)"
+                            Command       = @{ value = 'Add-CIPPGroupMember' }
+                            Parameters    = [PSCustomObject]@{
+                                GroupType    = $GroupType
+                                GroupId      = $Group.value
+                                Member       = @($CreationResults.Username)
+                                TenantFilter = $UserObj.tenantFilter
+                                APIName      = 'Add Group Member (Retry)'
+                            }
+                            ScheduledTime = [int64](([datetime]::UtcNow).AddMinutes(15) - (Get-Date '1/1/1970')).TotalSeconds
+                            PostExecution = @{ Webhook = $false; Email = $false; PSA = $false }
+                        }
+                        $null = Add-CIPPScheduledTask -Task $TaskBody -hidden $false -Headers $Headers -DisallowDuplicateName $true
+                        $Results.Add("Could not add $($CreationResults.Username) to $($Group.label) yet (Exchange replication delay). A retry has been scheduled in 15 minutes.")
+                    } catch {
+                        $Results.Add("Failed to add to group $($Group.label): $_")
+                    }
+                } else {
+                    $Results.Add("Failed to add to group $($Group.label): $_")
+                }
+            }
+        }
+    }
+
     if ($UserObj.setManager) {
-        $ManagerResult = Set-CIPPManager -User $CreationResults.Username -Manager $UserObj.setManager.value -TenantFilter $UserObj.tenantFilter -Headers $Headers
-        $Results.Add($ManagerResult)
+        $ManagerResults = Set-CIPPManager -Users $CreationResults.Username -Manager $UserObj.setManager.value -TenantFilter $UserObj.tenantFilter -Headers $Headers
+        $Results.Add($ManagerResults.Result)
     }
 
     if ($UserObj.setSponsor) {
-        $SponsorResult = Set-CIPPSponsor -User $CreationResults.Username -Sponsor $UserObj.setSponsor.value -TenantFilter $UserObj.tenantFilter -Headers $Headers
-        $Results.Add($SponsorResult)
+        $SponsorResults = Set-CIPPSponsor -Users $CreationResults.Username -Sponsor $UserObj.setSponsor.value -TenantFilter $UserObj.tenantFilter -Headers $Headers
+        $Results.Add($SponsorResults.Result)
     }
 
     return @{
