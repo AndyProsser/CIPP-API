@@ -2,7 +2,8 @@
 function Get-CIPPAuthentication {
     [CmdletBinding()]
     param (
-        $APIName = 'Get Keyvault Authentication'
+        $APIName = 'Get Keyvault Authentication',
+        [switch]$Force
     )
     $Variables = @('ApplicationID', 'ApplicationSecret', 'TenantID', 'RefreshToken')
 
@@ -19,56 +20,50 @@ function Get-CIPPAuthentication {
                 }
             }
             Write-Host "Got secrets from dev storage. ApplicationID: $env:ApplicationID"
-            #Get list of tenants that have 'directTenant' set to true
-            #get directtenants directly from table, avoid get-tenants due to performance issues
-            $TenantsTable = Get-CippTable -tablename 'Tenants'
-            $Filter = "PartitionKey eq 'Tenants' and delegatedPrivilegeStatus eq 'directTenant'"
-            $tenants = Get-CIPPAzDataTableEntity @TenantsTable -Filter $Filter
-            if ($tenants) {
-                $tenants | ForEach-Object {
-                    $secretname = $_.customerId -replace '-', '_'
-                    if ($secret.$secretname) {
-                        $name = $_.customerId
-                        Set-Item -Path env:$name -Value $secret.$secretname -Force
-                    }
-                }
-            }
         } else {
-            Write-Information 'Connecting to Azure'
-            Connect-AzAccount -Identity
-            $SubscriptionId = $env:WEBSITE_OWNER_NAME -split '\+' | Select-Object -First 1
-            try {
-                $Context = Get-AzContext
-                if ($Context.Subscription) {
-                    #Write-Information "Current context: $($Context | ConvertTo-Json)"
-                    if ($Context.Subscription.Id -ne $SubscriptionId) {
-                        Write-Information "Setting context to subscription $SubscriptionId"
-                        $null = Set-AzContext -SubscriptionId $SubscriptionId
-                    }
-                }
-            } catch {
-                Write-Information "ERROR: Could not set context to subscription $SubscriptionId."
-            }
-
-            $keyvaultname = ($env:WEBSITE_DEPLOYMENT_ID -split '-')[0]
-            #Get list of tenants that have 'directTenant' set to true
-            $TenantsTable = Get-CippTable -tablename 'Tenants'
-            $Filter = "PartitionKey eq 'Tenants' and delegatedPrivilegeStatus eq 'directTenant'"
-            $tenants = Get-CIPPAzDataTableEntity @TenantsTable -Filter $Filter
-            if ($tenants) {
-                $tenants | ForEach-Object {
-                    $name = $_.customerId
-                    $secret = Get-AzKeyVaultSecret -VaultName $keyvaultname -Name $name -AsPlainText -ErrorAction Stop
-                    if ($secret) {
-                        Set-Item -Path env:$name -Value $secret -Force
-                    }
-                }
-            }
+            $keyvaultname = Get-CippKeyVaultName
             $Variables | ForEach-Object {
-                Set-Item -Path env:$_ -Value (Get-AzKeyVaultSecret -VaultName $keyvaultname -Name $_ -AsPlainText -ErrorAction Stop) -Force
+                Set-Item -Path env:$_ -Value (Get-CippKeyVaultSecret -VaultName $keyvaultname -Name $_ -AsPlainText -ErrorAction Stop) -Force
             }
         }
+        # Set before certificate handling: Update-CIPPSAMCertificate goes through
+        # Get-GraphToken, which re-enters this function when SetFromProfile is unset
         $env:SetFromProfile = $true
+
+        # Preload the SAM certificate PFX alongside the other credentials, provisioning it
+        # when it does not exist yet. Non-fatal: auth must succeed even when certificate
+        # handling fails; the weekly token update retries provisioning.
+        try {
+            if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true' -or $env:NonLocalHostAzurite -eq 'true') {
+                if ($Secret.SAMCertificate) {
+                    $env:SAMCertificate = $Secret.SAMCertificate
+                }
+            } else {
+                try {
+                    $SAMCertificate = Get-CippKeyVaultSecret -VaultName $keyvaultname -Name 'SAMCertificate' -AsPlainText -ErrorAction Stop
+                    if ($SAMCertificate) {
+                        $env:SAMCertificate = $SAMCertificate
+                    }
+                } catch {
+                    Write-Information "SAM certificate not found in storage: $($_.Exception.Message)"
+                }
+            }
+
+            if (-not $env:SAMCertificate -and $env:SAMCertProvisionAttempted -ne 'true') {
+                # First run on this instance: provision the certificate now, at most once per
+                # process. The guard also breaks a recursion loop: Update-CIPPSAMCertificate
+                # calls Get-GraphToken, which re-enters this function when the AppCache
+                # ApplicationId does not match the environment.
+                # Set-CIPPSAMCertificate refreshes $env:SAMCertificate on success.
+                $env:SAMCertProvisionAttempted = 'true'
+                Write-Information 'No SAM certificate found, provisioning one now'
+                $CertResult = Update-CIPPSAMCertificate -ErrorAction Stop
+                Write-LogMessage -message "Provisioned SAM certificate during authentication load. Thumbprint: $($CertResult.Thumbprint), storage mode: $($CertResult.StorageMode)" -Sev 'Info' -API 'CIPP Authentication'
+            }
+        } catch {
+            Write-LogMessage -message 'Could not preload or provision the SAM certificate. It will be retried by the weekly token update.' -Sev 'Warning' -API 'CIPP Authentication' -LogData (Get-CippException -Exception $_)
+        }
+
         Write-LogMessage -message 'Reloaded authentication data from KeyVault' -Sev 'debug' -API 'CIPP Authentication'
 
         return $true

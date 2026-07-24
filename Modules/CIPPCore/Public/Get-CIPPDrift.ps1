@@ -29,26 +29,91 @@ function Get-CIPPDrift {
         [switch]$AllTenants
     )
 
-
+    $IntuneCapable = Test-CIPPStandardLicense -StandardName 'IntuneTemplate_general' -TenantFilter $TenantFilter -Preset Intune
+    $ConditionalAccessCapable = Test-CIPPStandardLicense -StandardName 'ConditionalAccessTemplate_general' -TenantFilter $TenantFilter -Preset Entra
     $IntuneTable = Get-CippTable -tablename 'templates'
-    $IntuneFilter = "PartitionKey eq 'IntuneTemplate'"
-    $RawIntuneTemplates = (Get-CIPPAzDataTableEntity @IntuneTable -Filter $IntuneFilter)
-    $AllIntuneTemplates = $RawIntuneTemplates | ForEach-Object {
+
+    # Load only IntuneTemplate partition for tag resolution and display name lookup
+    $RawIntuneTemplates = Get-CIPPAzDataTableEntity @IntuneTable -Filter "PartitionKey eq 'IntuneTemplate'"
+    # Build a hashtable indexed by Package for O(1) tag lookup
+    $TemplatesByPackage = @{}
+    foreach ($t in $RawIntuneTemplates) {
+        if ($t.Package) {
+            if (-not $TemplatesByPackage.ContainsKey($t.Package)) {
+                $TemplatesByPackage[$t.Package] = [System.Collections.Generic.List[object]]::new()
+            }
+            $TemplatesByPackage[$t.Package].Add($t)
+        }
+    }
+    # Build GUID-indexed hashtables for O(1) display name lookups in deviation loop
+    $IntuneTemplatesByGuid = @{}
+    $AllIntuneTemplates = foreach ($RawTemplate in $RawIntuneTemplates) {
         try {
-            $JSONData = $_.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+            $JSONData = $RawTemplate.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
             $data = $JSONData.RAWJson | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
             $data | Add-Member -NotePropertyName 'displayName' -NotePropertyValue $JSONData.Displayname -Force
             $data | Add-Member -NotePropertyName 'description' -NotePropertyValue $JSONData.Description -Force
             $data | Add-Member -NotePropertyName 'Type' -NotePropertyValue $JSONData.Type -Force
-            $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $_.RowKey -Force
+            $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $RawTemplate.RowKey -Force
+            $IntuneTemplatesByGuid[$RawTemplate.RowKey] = $data
+            # Built-in templates are seeded with RowKey = '<guid>.IntuneTemplate.json'; also index
+            # by the bare guid so display-name lookups that extract the guid from a standard key hit
+            if ($RawTemplate.RowKey -match '^([0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})\.' -and -not $IntuneTemplatesByGuid.ContainsKey($Matches[1])) {
+                $IntuneTemplatesByGuid[$Matches[1]] = $data
+            }
             $data
         } catch {
             # Skip invalid templates
         }
-    } | Sort-Object -Property displayName
+    }
+
+    # Load CA templates with GUID hashtable
+    $RawCATemplates = Get-CIPPAzDataTableEntity @IntuneTable -Filter "PartitionKey eq 'CATemplate'"
+    $CATemplatesByGuid = @{}
+    # Build a hashtable indexed by Package for O(1) CA tag lookup
+    $CATemplatesByPackage = @{}
+    foreach ($t in $RawCATemplates) {
+        if ($t.Package) {
+            if (-not $CATemplatesByPackage.ContainsKey($t.Package)) {
+                $CATemplatesByPackage[$t.Package] = [System.Collections.Generic.List[object]]::new()
+            }
+            $CATemplatesByPackage[$t.Package].Add($t)
+        }
+    }
+    $AllCATemplates = foreach ($RawTemplate in $RawCATemplates) {
+        try {
+            $data = $RawTemplate.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+            $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $RawTemplate.RowKey -Force
+            $CATemplatesByGuid[$RawTemplate.RowKey] = $data
+            # Built-in templates are seeded with RowKey = '<guid>.CATemplate.json'; also index
+            # by the bare guid so display-name lookups that extract the guid from a standard key hit
+            if ($RawTemplate.RowKey -match '^([0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})\.' -and -not $CATemplatesByGuid.ContainsKey($Matches[1])) {
+                $CATemplatesByGuid[$Matches[1]] = $data
+            }
+            $data
+        } catch {
+            # Skip invalid templates
+        }
+    }
+
+    # Load reusable settings templates for display name lookup
+    $RawReusableSettingTemplates = Get-CIPPAzDataTableEntity @IntuneTable -Filter "PartitionKey eq 'IntuneReusableSettingTemplate'"
+    $ReusableSettingTemplatesByGuid = @{}
+    foreach ($RawTemplate in $RawReusableSettingTemplates) {
+        try {
+            $data = $RawTemplate.JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+            $ReusableSettingTemplatesByGuid[$RawTemplate.RowKey] = [PSCustomObject]@{
+                displayName = $data.DisplayName ?? $data.displayName ?? $RawTemplate.RowKey
+                description = $data.Description ?? $data.description
+            }
+        } catch {
+            # Skip invalid templates
+        }
+    }
 
     try {
         $AlignmentData = Get-CIPPTenantAlignment -TenantFilter $TenantFilter -TemplateId $TemplateId | Where-Object -Property standardType -EQ 'drift'
+
         if (-not $AlignmentData) {
             Write-Warning "No alignment data found for tenant $TenantFilter"
             return @()
@@ -68,6 +133,13 @@ function Get-CIPPDrift {
         }
 
         $Results = [System.Collections.Generic.List[object]]::new()
+        # Tracks every StandardName that is still valid (live deviations + standards present in the
+        # template, whether assigned directly or via a package) so stale tenantDrift rows can be pruned.
+        $ValidDriftKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        # Policy rows are only pruned when the matching Graph collection succeeded, so a transient
+        # failure or missing license never wipes accepted/customer-specific statuses.
+        $IntunePoliciesCollected = $false
+        $CAPoliciesCollected = $false
         foreach ($Alignment in $AlignmentData) {
             # Initialize deviation collections
             $StandardsDeviations = [System.Collections.Generic.List[object]]::new()
@@ -82,136 +154,207 @@ function Get-CIPPDrift {
                         } else {
                             'New'
                         }
-                        #if the $ComparisonItem.StandardName contains *intuneTemplate*, then it's an Intune policy deviation, and we need to grab the correct displayname from the template table
-                        if ($ComparisonItem.StandardName -like '*intuneTemplate*') {
-                            $CompareGuid = $ComparisonItem.StandardName.Split('.') | Select-Object -Index 2
-                            Write-Host "Extracted GUID: $CompareGuid"
-                            $Template = $AllIntuneTemplates | Where-Object { $_.GUID -like "*$CompareGuid*" }
-                            if ($Template) { $displayName = $Template.displayName }
+                        # Reset displayName and description for each deviation to prevent carryover from previous iterations
+                        $displayName = $null
+                        $standardDescription = $null
+                        #if the $ComparisonItem.StandardName contains *IntuneTemplate*, then it's an Intune policy deviation, and we need to grab the correct displayname from the template table
+                        if ($ComparisonItem.StandardName -like '*IntuneTemplate*') {
+                            $Parts = $ComparisonItem.StandardName.Split('.')
+                            $CompareGuid = foreach ($p in $Parts) { if ($p -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}') { $p; break } }
+                            if ($CompareGuid -and $IntuneTemplatesByGuid.ContainsKey($CompareGuid)) {
+                                $Template = $IntuneTemplatesByGuid[$CompareGuid]
+                                $displayName = $Template.displayName
+                                $standardDescription = $Template.description
+                            }
+                        }
+                        # Handle Conditional Access templates
+                        if ($ComparisonItem.StandardName -like '*ConditionalAccessTemplate*') {
+                            $Parts = $ComparisonItem.StandardName.Split('.')
+                            $CompareGuid = foreach ($p in $Parts) { if ($p -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}') { $p; break } }
+                            if ($CompareGuid -and $CATemplatesByGuid.ContainsKey($CompareGuid)) {
+                                $Template = $CATemplatesByGuid[$CompareGuid]
+                                $displayName = $Template.displayName
+                                $standardDescription = $Template.description
+                            }
+                        }
+                        # Handle Reusable Settings templates
+                        if ($ComparisonItem.StandardName -like 'standards.ReusableSettingsTemplate.*') {
+                            $CompareGuid = $ComparisonItem.StandardName.Substring('standards.ReusableSettingsTemplate.'.Length)
+                            if ($CompareGuid -and $ReusableSettingTemplatesByGuid.ContainsKey($CompareGuid)) {
+                                $Template = $ReusableSettingTemplatesByGuid[$CompareGuid]
+                                $displayName = "Reusable Setting - $($Template.displayName)"
+                                $standardDescription = $Template.description
+                            }
+                        }
+                        # Handle QuarantineTemplate — suffix is hex-encoded display name, decode it
+                        if ($ComparisonItem.StandardName -like 'standards.QuarantineTemplate.*') {
+                            $HexEncodedName = $ComparisonItem.StandardName.Substring('standards.QuarantineTemplate.'.Length)
+                            if ($HexEncodedName) {
+                                $Chars = [System.Collections.Generic.List[char]]::new()
+                                for ($i = 0; $i -lt $HexEncodedName.Length; $i += 2) {
+                                    $Chars.Add([char][Convert]::ToInt32($HexEncodedName.Substring($i, 2), 16))
+                                }
+                                $displayName = "Quarantine Policy: $(-join $Chars)"
+                            }
                         }
                         $reason = if ($ExistingDriftStates.ContainsKey($ComparisonItem.StandardName)) { $ExistingDriftStates[$ComparisonItem.StandardName].Reason }
                         $User = if ($ExistingDriftStates.ContainsKey($ComparisonItem.StandardName)) { $ExistingDriftStates[$ComparisonItem.StandardName].User }
+                        $IsLicenseMissing = $ComparisonItem.ComplianceStatus -eq 'License Missing'
                         $StandardsDeviations.Add([PSCustomObject]@{
                                 standardName        = $ComparisonItem.StandardName
                                 standardDisplayName = $displayName
-                                expectedValue       = 'Compliant'
+                                standardDescription = $standardDescription
                                 receivedValue       = $ComparisonItem.StandardValue
                                 state               = 'current'
                                 Status              = $Status
                                 Reason              = $reason
                                 lastChangedByUser   = $User
+                                ComplianceStatus    = $ComparisonItem.ComplianceStatus
+                                LicenseAvailable    = if ($IsLicenseMissing) { $false } else { $ComparisonItem.LicenseAvailable }
+                                CurrentValue        = $ComparisonItem.CurrentValue
+                                ExpectedValue       = $ComparisonItem.ExpectedValue
                             })
                     }
                 }
             }
 
             # Perform full policy collection
-
-            # Always get live data when not in AllTenants mode
-            $IntuneRequests = @(
-                @{
-                    id     = 'deviceAppManagement/managedAppPolicies'
-                    url    = 'deviceAppManagement/managedAppPolicies'
-                    method = 'GET'
-                }
-                @{
-                    id     = 'deviceManagement/deviceCompliancePolicies'
-                    url    = 'deviceManagement/deviceCompliancePolicies'
-                    method = 'GET'
-                }
-                @{
-                    id     = 'deviceManagement/groupPolicyConfigurations'
-                    url    = 'deviceManagement/groupPolicyConfigurations'
-                    method = 'GET'
-                }
-                @{
-                    id     = 'deviceManagement/deviceConfigurations'
-                    url    = 'deviceManagement/deviceConfigurations'
-                    method = 'GET'
-                }
-                @{
-                    id     = 'deviceManagement/configurationPolicies'
-                    url    = 'deviceManagement/configurationPolicies'
-                    method = 'GET'
-                }
-                @{
-                    id     = 'deviceManagement/windowsDriverUpdateProfiles'
-                    url    = 'deviceManagement/windowsDriverUpdateProfiles'
-                    method = 'GET'
-                }
-                @{
-                    id     = 'deviceManagement/windowsFeatureUpdateProfiles'
-                    url    = 'deviceManagement/windowsFeatureUpdateProfiles'
-                    method = 'GET'
-                }
-                @{
-                    id     = 'deviceManagement/windowsQualityUpdatePolicies'
-                    url    = 'deviceManagement/windowsQualityUpdatePolicies'
-                    method = 'GET'
-                }
-                @{
-                    id     = 'deviceManagement/windowsQualityUpdateProfiles'
-                    url    = 'deviceManagement/windowsQualityUpdateProfiles'
-                    method = 'GET'
-                }
-            )
-
-            $TenantIntunePolicies = [System.Collections.Generic.List[object]]::new()
-
-            try {
-                $IntuneGraphRequest = New-GraphBulkRequest -Requests $IntuneRequests -tenantid $TenantFilter -asapp $true
-
-                foreach ($Request in $IntuneGraphRequest) {
-                    if ($Request.body.value) {
-                        foreach ($Policy in $Request.body.value) {
-                            $TenantIntunePolicies.Add([PSCustomObject]@{
-                                    Type   = $Request.id
-                                    Policy = $Policy
-                                })
-                        }
-                    }
-                }
-            } catch {
-                Write-Warning "Failed to get Intune policies: $($_.Exception.Message)"
-            }
-
-            # Get Conditional Access policies
-            try {
-                $CARequests = @(
+            if ($IntuneCapable) {
+                # Always get live data when not in AllTenants mode
+                $IntuneRequests = @(
                     @{
-                        id     = 'policies'
-                        url    = 'identity/conditionalAccess/policies'
+                        id     = 'deviceAppManagement/managedAppPolicies'
+                        url    = 'deviceAppManagement/managedAppPolicies?$top=999'
+                        method = 'GET'
+                    }
+                    @{
+                        id     = 'deviceManagement/deviceCompliancePolicies'
+                        url    = 'deviceManagement/deviceCompliancePolicies?$top=999'
+                        method = 'GET'
+                    }
+                    @{
+                        id     = 'deviceManagement/groupPolicyConfigurations'
+                        url    = 'deviceManagement/groupPolicyConfigurations?$top=999'
+                        method = 'GET'
+                    }
+                    @{
+                        id     = 'deviceManagement/deviceConfigurations'
+                        url    = 'deviceManagement/deviceConfigurations?$top=999'
+                        method = 'GET'
+                    }
+                    @{
+                        id     = 'deviceManagement/configurationPolicies'
+                        url    = 'deviceManagement/configurationPolicies?$top=999'
+                        method = 'GET'
+                    }
+                    @{
+                        id     = 'deviceManagement/windowsDriverUpdateProfiles'
+                        url    = 'deviceManagement/windowsDriverUpdateProfiles?$top=200'
+                        method = 'GET'
+                    }
+                    @{
+                        id     = 'deviceManagement/windowsFeatureUpdateProfiles'
+                        url    = 'deviceManagement/windowsFeatureUpdateProfiles?$top=200'
+                        method = 'GET'
+                    }
+                    @{
+                        id     = 'deviceManagement/windowsQualityUpdatePolicies'
+                        url    = 'deviceManagement/windowsQualityUpdatePolicies?$top=200'
+                        method = 'GET'
+                    }
+                    @{
+                        id     = 'deviceManagement/windowsQualityUpdateProfiles'
+                        url    = 'deviceManagement/windowsQualityUpdateProfiles?$top=200'
                         method = 'GET'
                     }
                 )
-                $CAGraphRequest = New-GraphBulkRequest -Requests $CARequests -tenantid $TenantFilter -asapp $true
-                $TenantCAPolicies = ($CAGraphRequest | Where-Object { $_.id -eq 'policies' }).body.value
-            } catch {
-                Write-Warning "Failed to get Conditional Access policies: $($_.Exception.Message)"
-                $TenantCAPolicies = @()
+
+                $TenantIntunePolicies = [System.Collections.Generic.List[object]]::new()
+
+                try {
+                    $IntuneGraphRequest = New-GraphBulkRequest -Requests $IntuneRequests -tenantid $TenantFilter -asapp $true
+
+                    foreach ($Request in $IntuneGraphRequest) {
+                        if ($Request.body.value) {
+                            foreach ($Policy in $Request.body.value) {
+                                $TenantIntunePolicies.Add([PSCustomObject]@{
+                                        Type   = $Request.id
+                                        Policy = $Policy
+                                    })
+                            }
+                        }
+                    }
+                    $IntunePoliciesCollected = $true
+                } catch {
+                    Write-Warning "Failed to get Intune policies: $($_.Exception.Message)"
+                }
+            }
+            # Get Conditional Access policies
+            if ($ConditionalAccessCapable) {
+                try {
+                    $CARequests = @(
+                        @{
+                            id     = 'policies'
+                            url    = 'identity/conditionalAccess/policies?$top=999'
+                            method = 'GET'
+                        }
+                    )
+                    $CAGraphRequest = New-GraphBulkRequest -Requests $CARequests -tenantid $TenantFilter -asapp $true
+                    $TenantCAPolicies = ($CAGraphRequest | Where-Object { $_.id -eq 'policies' }).body.value
+                    $CAPoliciesCollected = $true
+                } catch {
+                    Write-Warning "Failed to get Conditional Access policies: $($_.Exception.Message)"
+                    $TenantCAPolicies = @()
+                }
             }
 
             if ($Alignment.standardSettings) {
                 if ($Alignment.standardSettings.IntuneTemplate) {
-                    $IntuneTemplateIds = $Alignment.standardSettings.IntuneTemplate.TemplateList | ForEach-Object { $_.value }
+                    $IntuneTemplateIds = [System.Collections.Generic.List[string]]::new()
+                    foreach ($Template in $Alignment.standardSettings.IntuneTemplate) {
+                        if ($Template.TemplateList.value) {
+                            $IntuneTemplateIds.Add($Template.TemplateList.value)
+                        }
+                        if ($Template.'TemplateList-Tags') {
+                            foreach ($Tag in $Template.'TemplateList-Tags') {
+                                $TagValue = if ($Tag.value) { $Tag.value } else { $Tag }
+                                $ResolvedTagTemplates = if ($TemplatesByPackage.ContainsKey($TagValue)) { $TemplatesByPackage[$TagValue] } else { @() }
+                                foreach ($ResolvedTemplate in $ResolvedTagTemplates) {
+                                    if ($ResolvedTemplate.RowKey -and $ResolvedTemplate.RowKey -notin $IntuneTemplateIds) {
+                                        $IntuneTemplateIds.Add($ResolvedTemplate.RowKey)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 if ($Alignment.standardSettings.ConditionalAccessTemplate) {
-                    $CATemplateIds = $Alignment.standardSettings.ConditionalAccessTemplate.TemplateList | ForEach-Object { $_.value }
+                    $CATemplateIds = [System.Collections.Generic.List[string]]::new()
+                    foreach ($Template in $Alignment.standardSettings.ConditionalAccessTemplate) {
+                        if ($Template.TemplateList.value) {
+                            $CATemplateIds.Add($Template.TemplateList.value)
+                        }
+                        if ($Template.'TemplateList-Tags') {
+                            foreach ($Tag in $Template.'TemplateList-Tags') {
+                                $TagValue = if ($Tag.value) { $Tag.value } else { $Tag }
+                                $ResolvedCATagTemplates = if ($TagValue -and $CATemplatesByPackage.ContainsKey($TagValue)) { $CATemplatesByPackage[$TagValue] } else { @() }
+                                foreach ($ResolvedTemplate in $ResolvedCATagTemplates) {
+                                    if ($ResolvedTemplate.RowKey -and $ResolvedTemplate.RowKey -notin $CATemplateIds) {
+                                        $CATemplateIds.Add($ResolvedTemplate.RowKey)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
             # Get actual CA templates from templates table
             if ($CATemplateIds.Count -gt 0) {
                 try {
-                    $CATable = Get-CippTable -tablename 'templates'
-                    $CAFilter = "PartitionKey eq 'CATemplate'"
-                    $AllCATemplates = (Get-CIPPAzDataTableEntity @CATable -Filter $CAFilter) | ForEach-Object {
-                        $data = $_.JSON | ConvertFrom-Json -Depth 100
-                        $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $_.GUID -Force
-                        $data
-                    } | Sort-Object -Property displayName
-
-                    $TemplateCATemplates = $AllCATemplates | Where-Object { $_.GUID -in $CATemplateIds }
+                    $TemplateCATemplates = foreach ($id in $CATemplateIds) {
+                        if ($CATemplatesByGuid.ContainsKey($id)) { $CATemplatesByGuid[$id] }
+                    }
                 } catch {
                     Write-Warning "Failed to get CA templates: $($_.Exception.Message)"
                 }
@@ -220,8 +363,9 @@ function Get-CIPPDrift {
             # Get actual Intune templates from templates table
             if ($IntuneTemplateIds.Count -gt 0) {
                 try {
-
-                    $TemplateIntuneTemplates = $AllIntuneTemplates | Where-Object { $_.GUID -in $IntuneTemplateIds }
+                    $TemplateIntuneTemplates = foreach ($id in $IntuneTemplateIds) {
+                        if ($IntuneTemplatesByGuid.ContainsKey($id)) { $IntuneTemplatesByGuid[$id] }
+                    }
                 } catch {
                     Write-Warning "Failed to get Intune templates: $($_.Exception.Message)"
                 }
@@ -233,12 +377,23 @@ function Get-CIPPDrift {
                 $tenantPolicy.policy | Add-Member -MemberType NoteProperty -Name 'URLName' -Value $TenantPolicy.Type -Force
                 $TenantPolicyName = if ($TenantPolicy.Policy.displayName) { $TenantPolicy.Policy.displayName } else { $TenantPolicy.Policy.name }
                 foreach ($TemplatePolicy in $TemplateIntuneTemplates) {
-                    $TemplatePolicyName = if ($TemplatePolicy.displayName) { $TemplatePolicy.displayName } else { $TemplatePolicy.name }
-
-                    if ($TemplatePolicy.displayName -eq $TenantPolicy.Policy.displayName -or
-                        $TemplatePolicy.name -eq $TenantPolicy.Policy.name -or
-                        $TemplatePolicy.displayName -eq $TenantPolicy.Policy.name -or
-                        $TemplatePolicy.name -eq $TenantPolicy.Policy.displayName) {
+                    # Compare displayName-to-displayName and name-to-name (plus the cross pairings,
+                    # since some policy types are captured under one property but deployed under the
+                    # other) but require BOTH sides of each pairing to be non-empty before treating it
+                    # as a match. Most Intune policy types (compliance policies, device configurations,
+                    # group policy configs, etc.) only expose displayName and have no .name property at
+                    # all, so comparing raw .name values directly (as before) compared $null -eq $null,
+                    # which is $true in PowerShell - causing every tenant policy to falsely "match" the
+                    # first template as soon as any template lacked a .name property, suppressing all
+                    # tenant-only deviations. Note: templates always get a .displayName forced onto them
+                    # (see Add-Member above) even for name-only policy types like Settings Catalog
+                    # (deviceManagement/configurationPolicies), so the name-to-name pairing must still be
+                    # compared directly from the raw properties - collapsing to a single "effective name
+                    # preferring displayName" per side would silently break matching for those policies.
+                    if (($TemplatePolicy.displayName -and $TenantPolicy.Policy.displayName -and $TemplatePolicy.displayName -eq $TenantPolicy.Policy.displayName) -or
+                        ($TemplatePolicy.name -and $TenantPolicy.Policy.name -and $TemplatePolicy.name -eq $TenantPolicy.Policy.name) -or
+                        ($TemplatePolicy.displayName -and $TenantPolicy.Policy.name -and $TemplatePolicy.displayName -eq $TenantPolicy.Policy.name) -or
+                        ($TemplatePolicy.name -and $TenantPolicy.Policy.displayName -and $TemplatePolicy.name -eq $TenantPolicy.Policy.displayName)) {
                         $PolicyFound = $true
                         break
                     }
@@ -251,6 +406,8 @@ function Get-CIPPDrift {
                     } else {
                         'New'
                     }
+                    $reason = if ($ExistingDriftStates.ContainsKey($PolicyKey)) { $ExistingDriftStates[$PolicyKey].Reason }
+                    $User = if ($ExistingDriftStates.ContainsKey($PolicyKey)) { $ExistingDriftStates[$PolicyKey].User }
                     $PolicyDeviation = [PSCustomObject]@{
                         standardName        = $PolicyKey
                         standardDisplayName = "Intune - $TenantPolicyName"
@@ -258,6 +415,8 @@ function Get-CIPPDrift {
                         receivedValue       = ($TenantPolicy.Policy | ConvertTo-Json -Depth 10 -Compress)
                         state               = 'current'
                         Status              = $Status
+                        Reason              = $reason
+                        lastChangedByUser   = $User
                     }
                     $PolicyDeviations.Add($PolicyDeviation)
                 }
@@ -265,6 +424,11 @@ function Get-CIPPDrift {
 
             # Check for extra Conditional Access policies not in template
             foreach ($TenantCAPolicy in $TenantCAPolicies) {
+                # SharePoint auto-creates '[SharePoint admin center]...' CA policies when unmanaged
+                # device access is restricted (Set-SPOTenant -ConditionalAccessPolicy, e.g. via the
+                # unmanagedSync standard). They are system-managed, cannot be templated and come
+                # back when deleted, so they are never a deviation.
+                if (([string]$TenantCAPolicy.displayName).StartsWith('[SharePoint admin center]')) { continue }
                 $PolicyFound = $false
 
                 foreach ($TemplateCAPolicy in $TemplateCATemplates) {
@@ -281,13 +445,17 @@ function Get-CIPPDrift {
                     } else {
                         'New'
                     }
+                    $reason = if ($ExistingDriftStates.ContainsKey($PolicyKey)) { $ExistingDriftStates[$PolicyKey].Reason }
+                    $User = if ($ExistingDriftStates.ContainsKey($PolicyKey)) { $ExistingDriftStates[$PolicyKey].User }
                     $PolicyDeviation = [PSCustomObject]@{
                         standardName        = $PolicyKey
                         standardDisplayName = "Conditional Access - $($TenantCAPolicy.displayName)"
                         expectedValue       = 'This policy only exists in the tenant, not in the template.'
-                        receivedValue       = ($TenantCAPolicy | ConvertTo-Json -Depth 10 -Compress)
+                        receivedValue       = (ConvertTo-Json -InputObject $TenantCAPolicy -Depth 10 -Compress)
                         state               = 'current'
                         Status              = $Status
+                        Reason              = $reason
+                        lastChangedByUser   = $User
                     }
                     $PolicyDeviations.Add($PolicyDeviation)
                 }
@@ -299,14 +467,62 @@ function Get-CIPPDrift {
             $AllDeviations.AddRange($StandardsDeviations)
             $AllDeviations.AddRange($PolicyDeviations)
 
+            # Record which drift keys are still valid: live deviations and every standard in the
+            # template (compliant ones keep their row so an accepted status survives re-drift).
+            foreach ($Deviation in $AllDeviations) {
+                $KeyName = [string]$Deviation.standardName
+                if (-not [string]::IsNullOrWhiteSpace($KeyName)) { $null = $ValidDriftKeys.Add($KeyName) }
+            }
+            foreach ($ComparisonItem in $Alignment.ComparisonDetails) {
+                $KeyName = [string]$ComparisonItem.StandardName
+                if (-not [string]::IsNullOrWhiteSpace($KeyName)) { $null = $ValidDriftKeys.Add($KeyName) }
+            }
+
+            # Persist newly detected deviations to the tenantDrift table so the summary page can count them
+            $NewDriftEntities = [System.Collections.Generic.List[object]]::new()
+            foreach ($Deviation in $AllDeviations) {
+                # Diagnostic: standardName must be a scalar string. Azure Tables cannot store a PSObject,
+                # so a non-string here is what causes "Unsupported property types found: StandardName".
+                # Log the offending value (with tenant) so the producing standard can be identified.
+                if ($Deviation.standardName -isnot [string]) {
+                    Write-Warning "Drift deviation for tenant '$TenantFilter' has a non-string standardName (type $($Deviation.standardName.GetType().FullName)): $(ConvertTo-Json -InputObject $Deviation.standardName -Depth 5 -Compress -ErrorAction SilentlyContinue)"
+                }
+                # Coerce to string so the table write never fails on this property. RowKey already
+                # coerces via -replace; this makes the stored StandardName column match.
+                $StandardNameValue = [string]$Deviation.standardName
+                if ([string]::IsNullOrWhiteSpace($StandardNameValue)) { continue }
+                if (-not $ExistingDriftStates.ContainsKey($StandardNameValue)) {
+                    $RowKey = $StandardNameValue -replace '\.', '_'
+                    $NewDriftEntities.Add(@{
+                            PartitionKey = $TenantFilter
+                            RowKey       = $RowKey
+                            StandardName = $StandardNameValue
+                            Status       = 'New'
+                            LastModified = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                        })
+                }
+            }
+            if ($NewDriftEntities.Count -gt 0) {
+                try {
+                    Add-CIPPAzDataTableEntity @DriftTable -Entity $NewDriftEntities -Force
+                } catch {
+                    Write-Warning "Failed to persist new drift deviations: $($_.Exception.Message)"
+                }
+            }
+
+            # License-missing standards are excluded from the deviation buckets so the counts match
+            # the alignment score, which tracks them separately; they surface via licenseMissingDeviations.
+            $LicenseMissingDeviations = $AllDeviations | Where-Object { $_.ComplianceStatus -eq 'License Missing' }
+            $CountableDeviations = $AllDeviations | Where-Object { $_.ComplianceStatus -ne 'License Missing' }
+
             # Filter deviations by status for counting
-            $NewDeviations = $AllDeviations | Where-Object { $_.Status -eq 'New' }
-            $AcceptedDeviations = $AllDeviations | Where-Object { $_.Status -eq 'Accepted' }
-            $DeniedDeviations = $AllDeviations | Where-Object { $_.Status -like 'Denied*' }
-            $CustomerSpecificDeviations = $AllDeviations | Where-Object { $_.Status -eq 'CustomerSpecific' }
+            $NewDeviations = $CountableDeviations | Where-Object { $_.Status -eq 'New' }
+            $AcceptedDeviations = $CountableDeviations | Where-Object { $_.Status -eq 'Accepted' }
+            $DeniedDeviations = $CountableDeviations | Where-Object { $_.Status -like 'Denied*' }
+            $CustomerSpecificDeviations = $CountableDeviations | Where-Object { $_.Status -eq 'CustomerSpecific' }
 
             # Current deviations are New + Denied (not accepted or customer specific)
-            $CurrentDeviations = $AllDeviations | Where-Object { $_.Status -in @('New', 'Denied') }
+            $CurrentDeviations = $CountableDeviations | Where-Object { $_.Status -in @('New', 'Denied') }
 
             $Result = [PSCustomObject]@{
                 tenantFilter                    = $TenantFilter
@@ -318,16 +534,45 @@ function Get-CIPPDrift {
                 deniedDeviationsCount           = $DeniedDeviations.Count
                 customerSpecificDeviationsCount = $CustomerSpecificDeviations.Count
                 newDeviationsCount              = $NewDeviations.Count
-                alignedCount                    = $Alignment.CompliantStandards
+                licenseMissingDeviationsCount   = $LicenseMissingDeviations.Count
+                alignedCount                    = $Alignment.CompliantStandards - $AcceptedDeviations.Count - $CustomerSpecificDeviations.Count
                 currentDeviations               = @($CurrentDeviations)
                 acceptedDeviations              = @($AcceptedDeviations)
                 customerSpecificDeviations      = @($CustomerSpecificDeviations)
                 deniedDeviations                = @($DeniedDeviations)
+                licenseMissingDeviations        = @($LicenseMissingDeviations)
                 allDeviations                   = @($AllDeviations)
                 latestDataCollection            = $Alignment.LatestDataCollection
+                driftSettings                   = $AlignmentData
             }
 
             $Results.Add($Result)
+        }
+
+        # Prune stale tenantDrift rows so the alignment score only counts real deviations.
+        # A row goes stale when its policy was deleted/recreated in the tenant, or its template was
+        # removed from the drift standard (directly or via a package). Policy rows require a
+        # successful Graph collection this run before they are eligible for deletion.
+        $StaleDriftEntities = foreach ($Entity in $DriftEntities) {
+            $EntityName = [string]$Entity.StandardName
+            if ([string]::IsNullOrWhiteSpace($EntityName) -or $ValidDriftKeys.Contains($EntityName)) { continue }
+            if ($EntityName -like 'IntuneTemplates.*') {
+                if ($IntunePoliciesCollected) { $Entity }
+            } elseif ($EntityName -like 'ConditionalAccessTemplates.*') {
+                if ($CAPoliciesCollected) { $Entity }
+            } else {
+                $Entity
+            }
+        }
+        if ($StaleDriftEntities) {
+            try {
+                foreach ($StaleEntity in $StaleDriftEntities) {
+                    Remove-AzDataTableEntity @DriftTable -Entity $StaleEntity
+                }
+                Write-Information "Removed $(@($StaleDriftEntities).Count) stale drift deviation entries for $TenantFilter"
+            } catch {
+                Write-Warning "Failed to remove stale drift deviation entries for $($TenantFilter): $($_.Exception.Message)"
+            }
         }
 
         return @($Results)
